@@ -56,7 +56,6 @@ impl VcpMessage {
                     let str_port = args.next().ok_or("Malformed Packet: Missing port")?;
                     let port = str_port.parse::<u16>().map_err(|_| "Invalid port number")?;
                     let mimetype = args.next().ok_or("Malformed Packet: Missing Mimetype")?.to_string();
-                    args.next().ok_or("Malformed Packet: Missing Username")?;
                     let username = args.collect::<Vec<&str>>().join(" ").replace('"', "");
                      if username.is_empty() {
                         return Err("Malformed Packet: Missing Username".to_string())
@@ -68,7 +67,6 @@ impl VcpMessage {
                     let str_port = args.next().ok_or("Malformed Packet: Missing port")?;
                     let port = str_port.parse::<u16>().map_err(|_| "Invalid port number")?;
                     let mimetype = args.next().ok_or("Malformed Packet: Missing Mimetype")?.to_string();
-                    args.next().ok_or("Malformed Packet: Missing Username")?;
                     let username = args.collect::<Vec<&str>>().join(" ").replace('"', "");
                      if username.is_empty() {
                         return Err("Malformed Packet: Missing Username".to_string())
