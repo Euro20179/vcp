@@ -2,7 +2,7 @@ mod vcpreciever;
 
 use std::cmp;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{io, str::FromStr};
 use tokio::net::UdpSocket;
 use tokio::time::{Interval, interval};
@@ -34,6 +34,7 @@ pub enum VcpMessage {
     },
     Packet {
         packet_nr: u64,
+        timestamp: i64,
         data_len: u16,
         data: Vec<u8>,
     },
@@ -51,6 +52,23 @@ struct JitterBuffer {
 struct NetworkSnapshot {
     packets_received: u64,
     highest_packet_nr: u64
+}
+
+struct Connection {
+    jitter_buffer: JitterBuffer,
+    latency: i16,
+    packet_loss: f64,
+}
+
+impl Connection {
+    fn new() -> Self {
+        Self {
+            jitter_buffer: JitterBuffer::new(),
+            latency: 0, 
+            packet_loss: 0.0
+        }
+
+    }
 }
 
 impl NetworkSnapshot {
@@ -77,7 +95,7 @@ impl JitterBuffer {
 
 
     fn calculate_packet_loss(&self) -> f64 {
-        if self.snapshots.len() < 10 {return 0.0};
+        if self.snapshots.len() < 2 {return 0.0};
         let Some(current_snapshot) = self.snapshots.back() else {return 0.0};
         let highest = current_snapshot.highest_packet_nr;
         let Some(oldest_snapshot) = self.snapshots.front() else {return 0.0};
@@ -115,18 +133,23 @@ impl JitterBuffer {
 
 
 impl VcpMessage {
-    fn parse(bytes: &[u8]) -> Result<Self, String> {
+    fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
         if bytes.starts_with(b"PACKET/")  {
+            if bytes.len() < 15 {
+                return Err("Malformed Packet: Missing Data");
+            }
             let packet_nr_bytes = &bytes[7..15];
-            let packet_nr = u64::from_be_bytes(packet_nr_bytes.try_into().map_err(|_| "Malformed packet found when parsing packet number".to_string())?);
-            let data_len_bytes = &bytes[15..17]; 
-            let data_len = u16::from_be_bytes(data_len_bytes.try_into().map_err(|_| "Malformed packet found when parsing data length".to_string())?);
+            let packet_nr = u64::from_be_bytes(packet_nr_bytes.try_into().map_err(|_| "Malformed packet found when parsing packet number")?);
+            let timestamp_bytes = &bytes[15..23];
+            let timestamp = i64::from_be_bytes(timestamp_bytes.try_into().map_err(|_| "Malformed packet found when parsing timestamp")?);
+            let data_len_bytes = &bytes[23..25]; 
+            let data_len = u16::from_be_bytes(data_len_bytes.try_into().map_err(|_| "Malformed packet found when parsing data length")?);
             let data_len_us = data_len as usize;
-            if bytes.len() < 17 + data_len_us {
-                return Err("Malformed packet: data length exceeds packet size".to_string());
+            if bytes.len() < 25 + data_len_us {
+                return Err("Malformed packet: data length exceeds packet size");
             }
             let data = bytes[17..17 + data_len_us].to_vec();
-            return Ok(VcpMessage::Packet { packet_nr, data_len, data });
+            return Ok(VcpMessage::Packet { packet_nr, timestamp, data_len, data });
         } else {
             let text = str::from_utf8(bytes).map_err(|_| "Error converting byte array into string")?;
             let text = text.strip_suffix("\r\n").unwrap_or(text);
@@ -139,7 +162,7 @@ impl VcpMessage {
                     let mimetype = args.next().ok_or("Malformed Packet: Missing Mimetype")?.to_string();
                     let username = args.collect::<Vec<&str>>().join(" ").replace('"', "");
                     if username.is_empty() {
-                        return Err("Malformed Packet: Missing Username".to_string())
+                        return Err("Malformed Packet: Missing Username")
                     } 
                     return Ok(VcpMessage::Call { ip: ip.to_string(), port, mimetype, username });
                 }
@@ -150,7 +173,7 @@ impl VcpMessage {
                     let mimetype = args.next().ok_or("Malformed Packet: Missing Mimetype")?.to_string();
                     let username = args.collect::<Vec<&str>>().join(" ").replace('"', "");
                     if username.is_empty() {
-                        return Err("Malformed Packet: Missing Username".to_string())
+                        return Err("Malformed Packet: Missing Username")
                     } 
                     return Ok(VcpMessage::AcceptCall { ip, port, mimetype, username });
                 }
@@ -162,11 +185,11 @@ impl VcpMessage {
                     let username = args.collect::<Vec<&str>>().join(" ").replace('"', "");
 
                     if username.is_empty() {
-                        return Err("Malformed Packet: Missing Username".to_string())
+                        return Err("Malformed Packet: Missing Username")
                     } 
                     return Ok(VcpMessage::DeclineCall { ip, port, mimetype, username });
                 }
-                _ => Err("Unknown Command or Malformed Packet".to_string()),
+                _ => Err("Unknown Command or Malformed Packet"),
             }
 
         }
@@ -178,14 +201,13 @@ impl VcpMessage {
 async fn main() -> io::Result<()> {
     let sock = UdpSocket::bind("0.0.0.0:7000").await?;
     println!("Listening...");
-    let connections_map = Arc::new(Mutex::new(HashMap::<core::net::SocketAddr, JitterBuffer>::new()));
+    let connections_map = Arc::new(Mutex::new(HashMap::<core::net::SocketAddr, Connection>::new()));
 
     let udp_map_clone = Arc::clone(&connections_map);
     let udp_handle = tokio::spawn(async move {
         let mut buf = [0; 1500]; 
         println!("UDP task running...");
 
-        //may use later for tcp but not rn
         let mut receivers: HashMap<String, VcpReceiver> = HashMap::new();
         loop {
             match sock.recv_from(&mut buf).await {
@@ -218,20 +240,24 @@ async fn main() -> io::Result<()> {
 
                                     VcpMessage::AcceptCall { ip, port, mimetype, username } => {
                                         let mut cmap = udp_map_clone.lock().unwrap();
-                                        cmap.insert(addr, JitterBuffer::new());
+                                        cmap.insert(addr, Connection::new());
                                     },
 
                                     VcpMessage::DeclineCall { ip, port, mimetype, username } => todo!(),
 
 
-                                    VcpMessage::Packet { packet_nr, data_len, data } => {
+                                    VcpMessage::Packet { packet_nr, timestamp, data_len, data } => {
                                         let mut cmap = udp_map_clone.lock().unwrap();
 
-                                        if let Some(jitter_buffer) = cmap.get_mut(&addr) {
+                                        if let Some(conn) = cmap.get_mut(&addr) {
                                             //ignore packet if old
-                                            if packet_nr >= jitter_buffer.last_popped {
-                                                jitter_buffer.add_packet(packet_nr, &data);
+                                            if packet_nr >= conn.jitter_buffer.last_popped {
+                                                conn.jitter_buffer.add_packet(packet_nr, &data);
+                                                let cur_time = SystemTime::now().duration_since(UNIX_EPOCH).expect("System time broke").as_millis() as i64;
+                                                let latency = cur_time - timestamp;
+                                                conn.latency = latency as i16;
                                             }
+
 
                                         } else {
                                             //placeholder for later testing purposes
@@ -256,8 +282,10 @@ async fn main() -> io::Result<()> {
         loop {
             timer.tick().await;
             let mut cmap = cmap_clone.lock().unwrap();
-            for (_, jbuffer) in cmap.iter_mut() {
-                jbuffer.take_snapshot();
+            for (_, conn) in cmap.iter_mut() {
+                conn.jitter_buffer.take_snapshot();
+                let packet_loss = conn.jitter_buffer.calculate_packet_loss();
+                conn.packet_loss = packet_loss;
             }
         }
     });
