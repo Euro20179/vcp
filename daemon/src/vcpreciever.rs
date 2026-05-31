@@ -1,11 +1,8 @@
 #[derive(PartialEq, std::fmt::Debug, Eq, Clone, Copy)]
 pub enum VcpReceptionState {
     Action,
-    Ip,
-    Port,
-    Mimetype,
-    UserNameBegin,
-    UserNameMiddle,
+    UnQuotedArg,
+    QuotedArg,
     PacketNr,
     PacketLen,
     PacketData,
@@ -25,7 +22,8 @@ pub struct VcpReceiver {
     parsing_pos: usize,
     state: VcpReceptionState,
     packetlen: u64,
-    packet_data: Vec<u8>
+    packet_data: Vec<u8>,
+    action_name: String,
 }
 
 impl VcpReceiver {
@@ -37,7 +35,8 @@ impl VcpReceiver {
             state: VcpReceptionState::Action,
             final_action: vec![],
             packetlen: 0,
-            packet_data: vec![]
+            packet_data: vec![],
+            action_name: "".to_owned()
         };
 
         while r.has_bytes() && r.state != VcpReceptionState::Done{
@@ -61,14 +60,16 @@ impl VcpReceiver {
         type A = VcpReceptionState;
         self.state = match self.state {
             A::Action => {
-                if b == 0x20 /* SPACE */ {
+                if b == ' ' as u8 {
                     self.final_action.extend(&self.currently_parsing);
                     self.final_action.push(0x20);
+                    self.action_name = String::from_utf8(self.currently_parsing.clone()).expect("got non-utf-8 response");
                     self.currently_parsing.clear();
-                    A::Ip
-                } else if b == 0x2F /* / */  {
+                    A::UnQuotedArg
+                } else if b == '/' as u8  {
                     self.final_action.extend(&self.currently_parsing);
                     self.final_action.push(0x2F);
+                    self.action_name = String::from("PACKET");
                     self.currently_parsing.clear();
                     A::PacketNr
                 } else {
@@ -109,57 +110,39 @@ impl VcpReceiver {
                 }
             }
 
-            A::Ip => {
-                if b == 0x20 {
-                    self.final_action.extend(self.currently_parsing.clone());
+            A::UnQuotedArg => {
+                if b == ' ' as u8 {
+                    self.final_action.extend(&self.currently_parsing);
                     self.final_action.push(0x20);
                     self.currently_parsing.clear();
-                    A::Port
+                    A::UnQuotedArg
+                } else if b == '"' as u8 {
+                    self.final_action.extend(&self.currently_parsing);
+                    self.currently_parsing.clear();
+
+                    self.currently_parsing.push(b);
+                    A::QuotedArg
+                } else if b == '\r' as u8 || b == '\n' as u8 {
+                    self.final_action.extend(&self.currently_parsing);
+                    self.currently_parsing.clear();
+                    A::Done
                 } else {
                     self.currently_parsing.push(b);
-                    A::Ip
+                    A::UnQuotedArg
                 }
             }
 
-            A::Port => {
-                if b == 0x20 {
-                    self.final_action.extend(self.currently_parsing.clone());
-                    self.final_action.push(0x20);
-                    self.currently_parsing.clear();
-                    A::Mimetype
+            A::QuotedArg => {
+                if b == '"' as u8 {
+                    self.final_action.extend(&self.currently_parsing);
+                    self.final_action.push(b);
+                    A::UnQuotedArg
                 } else {
-                    self.currently_parsing.push(b);
-                    A::Port
+                    self.final_action.push(b);
+                    A::QuotedArg
                 }
             }
-            A::Mimetype => {
-                if b == 0x20 {
-                    self.final_action.extend(self.currently_parsing.clone());
-                    self.final_action.push(0x20);
-                    self.currently_parsing.clear();
-                    A::UserNameBegin
-                } else {
-                    self.currently_parsing.push(b);
-                    A::Mimetype
-                }
-            }
-            A::UserNameBegin => {
-                if b == 0x22 /* " */ {
-                    self.currently_parsing.push(b);
-                    A::UserNameMiddle
-                } else {
-                    A::UserNameBegin
-                }
-            },
-            A::UserNameMiddle => {
-                self.currently_parsing.push(b);
-                if b == 0x22 /* " */ {
-                    self.final_action.extend(self.currently_parsing.clone());
-                    A::Done
-                } else {
-                    A::UserNameMiddle
-                }
-            },
+
             A::Done => {
                 self.backlog.push(b);
                 A::Done
