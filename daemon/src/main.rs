@@ -4,7 +4,7 @@ use std::cmp;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{io, str::FromStr};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UdpSocket, TcpSocket};
 use tokio::time::{Interval, interval};
 use std::collections::{HashMap, btree_map};
@@ -39,6 +39,7 @@ pub enum VcpMessage {
         timestamp: i64,
         data_len: u16,
         data: Vec<u8>,
+        raw_bytes: Vec<u8>
     },
 }
 
@@ -47,7 +48,6 @@ struct JitterBuffer {
     last_popped: u64,
     highest_packet_nr: u64,
     total_received_packets: u64,
-    //list of snapshots taken every 10 seconds up to 60
     snapshots: VecDeque<NetworkSnapshot>,
 }
 
@@ -151,7 +151,7 @@ impl VcpMessage {
                 return Err("Malformed packet: data length exceeds packet size");
             }
             let data = bytes[25..25 + data_len_us].to_vec();
-            return Ok(VcpMessage::Packet { packet_nr, timestamp, data_len, data });
+            return Ok(VcpMessage::Packet { packet_nr, timestamp, data_len, data, raw_bytes: bytes.to_vec() });
         } else {
             let text = str::from_utf8(bytes).map_err(|_| "Error converting byte array into string")?;
             let text = text.strip_suffix("\r\n").unwrap_or(text);
@@ -199,7 +199,7 @@ impl VcpMessage {
 }
 
 async fn udp_thread(
-    sock: UdpSocket,
+    sock: Arc<UdpSocket>,
     udp_map_clone: Arc<Mutex<HashMap<String, Connection>>>
 ) {
     let mut buf = [0; 1500]; 
@@ -257,13 +257,13 @@ async fn udp_thread(
                                 VcpMessage::DeclineCall { ip, port, mimetype, username } => todo!(),
 
 
-                                VcpMessage::Packet { packet_nr, timestamp, data_len, data } => {
+                                VcpMessage::Packet { packet_nr, timestamp, data_len, data, raw_bytes } => {
                                     let mut cmap = udp_map_clone.lock().unwrap();
 
                                     if let Some(conn) = cmap.get_mut(&addr.ip().to_string()) {
                                         //ignore packet if old
                                         if packet_nr >= conn.jitter_buffer.last_popped {
-                                            conn.jitter_buffer.add_packet(packet_nr, &data);
+                                            conn.jitter_buffer.add_packet(packet_nr, &raw_bytes);
                                             let cur_time = SystemTime::now().duration_since(UNIX_EPOCH).expect("System time broke").as_millis() as i64;
                                             let latency = cur_time - timestamp;
                                             conn.latency = latency as i16;
@@ -290,10 +290,11 @@ async fn udp_thread(
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let sock = UdpSocket::bind("0.0.0.0:7000").await?;
+    let shared_socket = Arc::new(sock);
     eprintln!("Listening...");
     let connections_map = Arc::new(Mutex::new(HashMap::<String, Connection>::new()));
 
-    let udp_handle = tokio::spawn(udp_thread(sock, Arc::clone(&connections_map)));
+    let udp_handle = tokio::spawn(udp_thread(Arc::clone(&shared_socket), Arc::clone(&connections_map)));
 
     //for taking snapshots of connections
     let cmap_clone = Arc::clone(&connections_map);
@@ -312,23 +313,29 @@ async fn main() -> io::Result<()> {
     });
 
     let cmap_clone = Arc::clone(&connections_map);
+    
+    let tcp_sock = TcpSocket::new_v4().unwrap();
+    let addr = "127.0.0.1:8432".parse().unwrap();
+    tcp_sock.bind(addr)?;
+    let tcp = tcp_sock.listen(1)?;
+    let (conn, addr) = tcp.accept().await?;
+    let(read_half, write_half) = conn.into_split();
+    let shared_tcp_writer = Arc::new(tokio::sync::Mutex::new(write_half));
+    let cmap_clone = connections_map.clone();
+    let udp_clone = shared_socket.clone();
     tokio::spawn(async move {
         unsafe { std::env::set_var("VCD_SOCKET", "127.0.0.1") };
         unsafe { std::env::set_var("VCD_SOCKET_PORT", "8432") };
-        let sock = TcpSocket::new_v4().unwrap();
-        let addr = "127.0.0.1:8432".parse().unwrap();
-        sock.bind(addr)?;
-        let tcp = sock.listen(1)?;
-        match tcp.accept().await {
-            Ok((mut conn, addr)) => {
-                let mut buf = [0; 1024];
-                let mut receiver = VcpReceiver::new(vec![]);
-                let mut has_responded_to_call = false;
+        let sock = udp_clone;
+        let mut tcp_reader = read_half;
+        let mut buf = [0; 1024];
+        let mut receiver = VcpReceiver::new(vec![]);
+        let mut has_responded_to_call = false;
 
                 //start with a dummy address
-                let mut to_send_to: SocketAddr = SocketAddr::from_str("0.0.0.0:10000").unwrap();
+        let mut to_send_to: SocketAddr = SocketAddr::from_str("0.0.0.0:10000").unwrap();
                 loop {
-                    if let Ok(amt) = conn.read(&mut buf).await {
+                    if let Ok(amt) = tcp_reader.read(&mut buf).await {
                         if receiver.get_state() != &VcpReceptionState::Done && !has_responded_to_call{
                             receiver.feed(buf[0..amt].to_vec());
                         } else if !has_responded_to_call{
@@ -338,7 +345,6 @@ async fn main() -> io::Result<()> {
                                 Ok(r) =>  {
                                     match r {
                                         VcpMessage::AcceptCall { ip, port, mimetype, username } => {
-                                            let sock = UdpSocket::bind("0.0.0.0:0").await?;
                                             let response = format!("ACCEPTCALL {} {} {} \"{}\"\r\n", ip, port, mimetype, username);
 
                                             match SocketAddr::from_str(&format!("{}:{}", ip, port).to_string()) {
@@ -379,20 +385,40 @@ async fn main() -> io::Result<()> {
                             };
 
                             for connection in keys {
-                                let sock = UdpSocket::bind("0.0.0.0:0").await?;
-                                sock.send_to(&buf[..amt], format!("{connection}:7000")).await?;
+                                if let Err(e) = sock.send_to(&buf[..amt], format!("{connection}:7000")).await {
+                                    eprintln!("Failed to forward packet to {}: {}", connection, e);
+                                }
                             }
 
                             receiver.reset();
                         }
                     }
                 }
-            }
-            Err(e) => println!("{}", e)
-        }
-        Ok::<(), std::io::Error>(())
     });
+    let cmap_clone = connections_map.clone();
+    let value = shared_tcp_writer.clone();
+    tokio::spawn(async move {
+        let mut timer = interval(Duration::from_millis(40));
+       loop {
+            timer.tick().await;
+            let mut packets_to_send: Vec<Vec<u8>> = vec![];
+            if let Ok(mut cmap) = cmap_clone.lock() {
+                for (_, conn) in cmap.iter_mut() {
+                    if let Some((_nr, packet)) = conn.jitter_buffer.buffer.pop_first() {
+                        packets_to_send.push(packet);
+                    }
+                }
+            }
+            for packet in packets_to_send {
+                let mut tcp_conn = value.lock().await;
+                if let Err(e) = tcp_conn.write_all(&packet).await {
+                    eprintln!("Failed to write packet: {}", e);
+                }
+            }
+        }
 
+    });
+    
     std::future::pending::<()>().await;
     Ok(())
 }
