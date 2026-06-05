@@ -112,7 +112,12 @@ impl VcpReceiver {
                     self.final_action.extend(&self.currently_parsing);
                     self.packetlen = u16::from_be_bytes(self.currently_parsing.clone().try_into().expect("could not convert bytes into 8 wide word for packet data length"));
                     self.currently_parsing.clear();
-                    A::PacketData
+                    if self.packetlen == 0 {
+                        self.packet_data = vec![];
+                        A::Done
+                    } else {
+                        A::PacketData
+                    }
                 } else {
                     A::PacketLen
                 }

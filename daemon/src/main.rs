@@ -105,9 +105,12 @@ impl JitterBuffer {
 
         let expected_packets = highest - lowest + 1;
         let received_packets = current_snapshot.packets_received - oldest_snapshot.packets_received as u64;
-        let diff = expected_packets - received_packets;
-        let packet_loss_ratio = (diff as f64) / (expected_packets as f64);
-        return packet_loss_ratio * 100.0;
+        if received_packets < expected_packets {
+            let diff = expected_packets - received_packets;
+            let packet_loss_ratio = (diff as f64) / (expected_packets as f64);
+            return packet_loss_ratio * 100.0;
+        }
+        return 100.0;
     }
 
     fn add_packet(&mut self, packet_nr: u64, packet: &Vec<u8>,) {
@@ -252,16 +255,13 @@ async fn main() -> io::Result<()> {
         }
     });
 
-    let cmap_clone = Arc::clone(&connections_map);
-    
     let tcp_sock = TcpSocket::new_v4().unwrap();
-    let addr = "127.0.0.1:8432".parse().unwrap();
-    tcp_sock.bind(addr)?;
+    tcp_sock.bind("127.0.0.1:8432".parse().unwrap())?;
     let tcp = tcp_sock.listen(1)?;
     let (conn, addr) = tcp.accept().await?;
     let(read_half, write_half) = conn.into_split();
     let shared_tcp_writer = Arc::new(tokio::sync::Mutex::new(write_half));
-    let cmap_clone = connections_map.clone();
+    let cmap_clone = Arc::clone(&connections_map);
     let udp_clone = shared_socket.clone();
     tokio::spawn(async move {
         let sock = udp_clone;
@@ -270,70 +270,71 @@ async fn main() -> io::Result<()> {
         let mut receiver = VcpReceiver::new(vec![]);
         let mut has_responded_to_call = false;
 
-        /**********************************************************************/
-        /*                     START WITH A DUMMY ADDRESS                     */
-        let mut to_send_to: SocketAddr = SocketAddr::from_str("0.0.0.0:10000")
-                                .unwrap();
-        /*                      INCREDIBLY IMPORTANT                          */
-        /**********************************************************************/
-                loop {
-                    if let Ok(amt) = tcp_reader.read(&mut buf).await {
-                        if receiver.get_state() != &VcpReceptionState::Done && !has_responded_to_call{
-                            receiver.feed(buf[0..amt].to_vec());
-                        } else if !has_responded_to_call{
-                            has_responded_to_call = true;
-                            let args = receiver.get_args();
-                            match receiver.get_action().as_str() {
-                                "ACCEPTCALL" => {
-                                    let ip = args[0].clone();
-                                    let port = args[1].clone();
-                                    let mimetype = args[2].clone();
-                                    let username = args[3].clone();
-                                    let response = format!("ACCEPTCALL {} {} {} \"{}\"\r\n", ip, port, mimetype, username);
+        /*********************************************************************
+        *                  <del>                                             *
+        *                      START WITH A DUMMY ADDRESS                    *
+        *                      INCREDIBLY IMPORTANT                          *
+        *                  </del>                                            *
+        *                  THE DUMMY ADDRESS HAS BEEN DELETED                *
+        *                  PLEASE SEE SECTION 3.4-A AS TO WHY THIS IS        *
+        *********************************************************************/
+        loop {
+            if let Ok(amt) = tcp_reader.read(&mut buf).await {
+                if receiver.get_state() != &VcpReceptionState::Done && !has_responded_to_call{
+                    receiver.feed(buf[0..amt].to_vec());
+                } else if !has_responded_to_call{
+                    has_responded_to_call = true;
+                    let args = receiver.get_args();
+                    match receiver.get_action().as_str() {
+                        "ACCEPTCALL" => {
+                            let ip = args[0].clone();
+                            let port = args[1].clone();
+                            let mimetype = args[2].clone();
+                            let username = args[3].clone();
+                            let response = format!("ACCEPTCALL {} {} {} \"{}\"\r\n", ip, port, mimetype, username);
 
-                                    match SocketAddr::from_str(&format!("{}:{}", ip, port).to_string()) {
-                                        Ok(addr) => {
-                                            to_send_to = addr;
-                                            if let Err(e) = sock.send_to(response.as_bytes(), to_send_to).await {
-                                                eprintln!("Failed to send resp {}", e);
-                                            }
-                                        },
-                                        Err(e) => {
-                                            eprintln!("Failed to convert ip {}", e);
-                                        }
-                                    };
-                                    eprintln!("{} picked up {}:{}'s call with {}", username, ip, port, mimetype)
+                            match SocketAddr::from_str(&format!("{}:{}", ip, port).to_string()) {
+                                Ok(addr) => {
+                                    if let Err(e) = sock.send_to(response.as_bytes(), addr).await {
+                                        eprintln!("Failed to send resp {}", e);
+                                    }
                                 },
-                                "DECLINECALL" => {
-                                    let ip = args[0].clone();
-                                    let port = args[1].clone();
-                                    let mimetype = args[2].clone();
-                                    let username = args[3].clone();
-                                    eprintln!("{} declined to pick up {}:{}'s call", username, ip, port)
-                                },
-                                _ => eprintln!("Invalid action {}", receiver.get_action().as_str()),
-                            }
-
-                            receiver.reset();
-                        } else {
-
-                            let keys: Vec<String> = {
-                                if let Ok(guard) = cmap_clone.lock() {
-                                    guard.keys().cloned().collect()
-                                } else {
-                                    //this will drop a packet
-                                    vec![]
+                                Err(e) => {
+                                    eprintln!("Failed to convert ip {}", e);
                                 }
                             };
+                            eprintln!("{} picked up {}:{}'s call with {}", username, ip, port, mimetype)
+                        },
+                        "DECLINECALL" => {
+                            let ip = args[0].clone();
+                            let port = args[1].clone();
+                            let mimetype = args[2].clone();
+                            let username = args[3].clone();
+                            eprintln!("{} declined to pick up {}:{}'s call", username, ip, port)
+                        },
+                        _ => eprintln!("Invalid action {}", receiver.get_action().as_str()),
+                    }
 
-                            for connection in keys {
-                                if let Err(e) = sock.send_to(&buf[..amt], format!("{connection}:7000")).await {
-                                    eprintln!("Failed to forward packet to {}: {}", connection, e);
-                                }
-                            }
+                    receiver.reset();
+                } else {
+
+                    let keys: Vec<String> = {
+                        if let Ok(guard) = cmap_clone.lock() {
+                            guard.keys().cloned().collect()
+                        } else {
+                            //this will drop a packet
+                            vec![]
+                        }
+                    };
+
+                    for connection in keys {
+                        if let Err(e) = sock.send_to(&buf[..amt], format!("{connection}:7000")).await {
+                            eprintln!("Failed to forward packet to {}: {}", connection, e);
                         }
                     }
                 }
+            }
+        }
     });
     let cmap_clone = connections_map.clone();
     let value = shared_tcp_writer.clone();
